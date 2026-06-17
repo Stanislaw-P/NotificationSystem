@@ -44,7 +44,7 @@ namespace NotificationService.Worker
 
             // 1. ќбъ€вл€ем Dead Letter Exchange (тип direct Ч простой роутинг)
             await _channel.ExchangeDeclareAsync(
-                exchange: DeadLetterQueueName,
+                exchange: DeadLetterExchangeName,
                 type: ExchangeType.Direct,
                 durable: true,
                 cancellationToken: cancellationToken);
@@ -66,7 +66,7 @@ namespace NotificationService.Worker
 
             // 4. ќбъ€вл€ем основную очередь с указанием DLX
             // “еперь при nack(requeue:false) сообщение автоматически
-            // улетит в DeadLetterExchangeName ? DeadLetterQueueName
+            // улетит в DeadLetterExchangeName -> DeadLetterQueueName
             await _channel.QueueDeclareAsync(
                 queue: QueueName,
                 durable: true,
@@ -74,14 +74,11 @@ namespace NotificationService.Worker
                 autoDelete: false,
                 arguments: new Dictionary<string, object?>
                 {
-                    { "x-dead-letter-exchange", DeadLetterExchangeName },
-                    { "x-dead-letter-routing-key", DeadLetterQueueName }
+            { "x-dead-letter-exchange", DeadLetterExchangeName },
+            { "x-dead-letter-routing-key", DeadLetterQueueName }
                 },
                 cancellationToken: cancellationToken);
 
-            // √оворим брокеру: присылай не больше 1 сообщени€ за раз.
-            // —ледующее придЄт только после того, как мы отправим ack/nack на текущее.
-            // Ѕез этого RabbitMQ может завалить воркер сотн€ми сообщений одновременно.
             await _channel.BasicQosAsync(
                 prefetchSize: 0,
                 prefetchCount: 1,
@@ -107,17 +104,16 @@ namespace NotificationService.Worker
 
                     if (orderEvent is null)
                     {
-                        _logger.LogWarning("Received null or invalid message with delivery tag {DeliveryTag}", deliveryTag);
-
-                        // requeue: false Ч битое сообщение обратно в очередь не кладЄм,
-                        // иначе получим бесконечный цикл
+                        _logger.LogWarning("Malformed message, sending to DLQ immediately");
                         await _channel!.BasicNackAsync(deliveryTag, multiple: false, requeue: false);
+                        return;
                     }
 
                     _logger.LogInformation(
-                        "Processing order {OrderId} for {Email}",
-                        orderEvent!.OrderId,
-                        orderEvent.CustomerEmail);
+                        "Processing order {OrderId} for {Email}, attempt #{Attempt}",
+                        orderEvent.OrderId,
+                        orderEvent.CustomerEmail,
+                        GetRetryCount(args.BasicProperties) + 1);
 
                     await _emailSender.SendEmailAsync(
                         toEmail: orderEvent.CustomerEmail,
@@ -125,19 +121,35 @@ namespace NotificationService.Worker
                         body: $"—пасибо за заказ!\n\n—умма: {orderEvent.Amount:C}\nƒата: {orderEvent.CreatedAt:g}",
                         cancellationToken: stoppingToken);
 
-                    // ¬сЄ ок Ч говорим брокеру, что сообщение обработано и можно удал€ть
                     await _channel!.BasicAckAsync(deliveryTag, multiple: false);
 
                     _logger.LogInformation("Order {OrderId} processed successfully", orderEvent.OrderId);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error processing message with delivery tag {DeliveryTag}", deliveryTag);
+                    var retryCount = GetRetryCount(args.BasicProperties);
 
-                    // requeue: true Ч вернуть сообщение в очередь дл€ повторной попытки.
-                    // ¬ продакшене здесь нужен счЄтчик retry + Dead Letter Queue,
-                    // чтобы "отравленное" сообщение не зависло в цикле навечно
-                    await _channel!.BasicNackAsync(deliveryTag, multiple: false, requeue: true);
+                    if (retryCount >= MaxRetryCount)
+                    {
+                        // »счерпали попытки Ч отправл€ем в DLQ без повтора
+                        _logger.LogError(ex,
+                            "Order processing failed after {MaxRetry} attempts, sending to DLQ. DeliveryTag: {Tag}",
+                            MaxRetryCount,
+                            deliveryTag);
+
+                        await _channel!.BasicNackAsync(deliveryTag, multiple: false, requeue: false);
+                    }
+                    else
+                    {
+                        // ≈щЄ есть попытки Ч возвращаем в очередь
+                        _logger.LogWarning(ex,
+                            "Order processing failed, attempt {Attempt}/{MaxRetry}. Will retry. DeliveryTag: {Tag}",
+                            retryCount + 1,
+                            MaxRetryCount,
+                            deliveryTag);
+
+                        await _channel!.BasicNackAsync(deliveryTag, multiple: false, requeue: true);
+                    }
                 }
             };
 
@@ -161,6 +173,29 @@ namespace NotificationService.Worker
                 await _connection.CloseAsync();
 
             await base.StopAsync(cancellationToken);
+        }
+
+        private static int GetRetryCount(IReadOnlyBasicProperties properties)
+        {
+            // x-death по€вл€етс€ только после первого nack,
+            // при первой попытке его нет вообще
+            if (properties.Headers is null ||
+                !properties.Headers.TryGetValue("x-death", out var xDeath))
+                return 0;
+
+            // x-death Ч это List<object>, каждый элемент Ч Dictionary с пол€ми
+            // "count" (сколько раз), "queue", "reason" и др.
+            if (xDeath is List<object> deaths && deaths.Count > 0)
+            {
+                var firstDeath = deaths[0] as Dictionary<string, object>;
+                if (firstDeath is not null &&
+                    firstDeath.TryGetValue("count", out var count))
+                {
+                    return Convert.ToInt32(count);
+                }
+            }
+
+            return 0;
         }
     }
 }
