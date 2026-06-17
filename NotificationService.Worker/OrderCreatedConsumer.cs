@@ -12,6 +12,9 @@ namespace NotificationService.Worker
     public class OrderCreatedConsumer : BackgroundService
     {
         private const string QueueName = "order-created-queue";
+        private const string DeadLetterQueueName = "order-created-dlq";
+        private const string DeadLetterExchangeName = "order-created-dlx";
+        private const int MaxRetryCount = 3;
 
         private readonly ILogger<OrderCreatedConsumer> _logger;
         private readonly IEmailSender _emailSender;
@@ -39,19 +42,51 @@ namespace NotificationService.Worker
             _connection = await factory.CreateConnectionAsync(cancellationToken);
             _channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken);
 
-            // ќбъ€вл€ем очередь Ч параметры должны совпадать с тем,
-            // что объ€вл€ет OrderService, иначе RabbitMQ вернЄт ошибку
+            // 1. ќбъ€вл€ем Dead Letter Exchange (тип direct Ч простой роутинг)
+            await _channel.ExchangeDeclareAsync(
+                exchange: DeadLetterQueueName,
+                type: ExchangeType.Direct,
+                durable: true,
+                cancellationToken: cancellationToken);
+
+            // 2. ќбъ€вл€ем Dead Letter Queue
             await _channel.QueueDeclareAsync(
-                       queue: QueueName,
-                       durable: true,
-                       exclusive: false,
-                       autoDelete: false,
-                       cancellationToken: cancellationToken);
+                queue: DeadLetterQueueName,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                cancellationToken: cancellationToken);
+
+            // 3. Ѕиндим DLQ к DLX
+            await _channel.QueueBindAsync(
+                queue: DeadLetterQueueName,
+                exchange: DeadLetterExchangeName,
+                routingKey: DeadLetterQueueName,
+                cancellationToken: cancellationToken);
+
+            // 4. ќбъ€вл€ем основную очередь с указанием DLX
+            // “еперь при nack(requeue:false) сообщение автоматически
+            // улетит в DeadLetterExchangeName ? DeadLetterQueueName
+            await _channel.QueueDeclareAsync(
+                queue: QueueName,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: new Dictionary<string, object?>
+                {
+                    { "x-dead-letter-exchange", DeadLetterExchangeName },
+                    { "x-dead-letter-routing-key", DeadLetterQueueName }
+                },
+                cancellationToken: cancellationToken);
 
             // √оворим брокеру: присылай не больше 1 сообщени€ за раз.
             // —ледующее придЄт только после того, как мы отправим ack/nack на текущее.
             // Ѕез этого RabbitMQ может завалить воркер сотн€ми сообщений одновременно.
-            await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false, cancellationToken: cancellationToken);
+            await _channel.BasicQosAsync(
+                prefetchSize: 0,
+                prefetchCount: 1,
+                global: false,
+                cancellationToken: cancellationToken);
 
             await base.StartAsync(cancellationToken);
         }
