@@ -24,8 +24,6 @@ namespace NotificationService.Worker.Services
 
         public async Task SendEmailAsync(string toEmail, string subject, string body, CancellationToken cancellationToken = default)
         {
-            throw new Exception("SMTP недоступен — тест DLQ");
-
             var message = new MimeMessage();
             message.From.Add(new MailboxAddress("Order System", _options.Username));
             message.To.Add(MailboxAddress.Parse(toEmail));

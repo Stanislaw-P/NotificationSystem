@@ -20,12 +20,6 @@ namespace OrderService.Api.Services
         {
             using var channel = await connection.CreateChannelAsync();
 
-            await channel.QueueDeclareAsync(
-                queue: QueueName,
-                durable: true,
-                exclusive: false,
-                autoDelete: false);
-
             var json = JsonSerializer.Serialize(orderEvent);
             var body = Encoding.UTF8.GetBytes(json);
 

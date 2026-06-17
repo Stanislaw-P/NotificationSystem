@@ -38,7 +38,7 @@ namespace OrderService.Api.Controllers
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to publish OrderCreatedEvent for OrderId: {OrderId}", orderEvent.OrderId);
-                return BadRequest(ex);
+                return BadRequest(ex.Message);
             }
         }
     }
