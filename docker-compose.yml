@@ -9,8 +9,8 @@ services:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     ports:
-      - "5672:5672"   # Порт для подключения приложений (AMQP)
-      - "15672:15672"  # Порт для панели управления (Management UI)
+      - "5672:5672"
+      - "15672:15672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -19,28 +19,46 @@ services:
       timeout: 5s
       retries: 5
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-notifications-system
+    restart: always
+    environment:
+      POSTGRES_DB: notifications
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d notifications"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   smtp4dev:
     image: rnwood/smtp4dev:latest
     ports:
-      - "5000:80"    # веб-интерфейс
-      - "25:25"      # SMTP порт
+      - "5000:80"
+      - "25:25"
 
   orderservice.api:
     build:
-      context: .                   
+      context: .
       dockerfile: OrderService.Api/Dockerfile
     container_name: orderservice-api
     restart: on-failure
     environment:
       ASPNETCORE_ENVIRONMENT: Development
-      RabbitMq__HostName: rabbitmq          # имя сервиса в docker-сети
+      RabbitMq__HostName: rabbitmq
       RabbitMq__UserName: guest
       RabbitMq__Password: guest
     ports:
       - "8080:8080"
     depends_on:
       rabbitmq:
-        condition: service_healthy          # ждём пока RabbitMQ реально готов
+        condition: service_healthy
 
   notificationservice.worker:
     build:
@@ -53,11 +71,16 @@ services:
       RabbitMq__HostName: rabbitmq
       RabbitMq__UserName: guest
       RabbitMq__Password: guest
-      Smtp__Host: smtp4dev                 
+      Smtp__Host: smtp4dev
       Smtp__Port: 25
+      # Двойное подчёркивание = вложенная секция ConnectionStrings:DefaultConnection
+      ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=notifications;Username=postgres;Password=postgres"
     depends_on:
       rabbitmq:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
 volumes:
   rabbitmq_data:
+  postgres_data:

@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Options;
+using NotificationService.Worker.Data;
 using NotificationService.Worker.Options;
 using NotificationService.Worker.Services;
 using RabbitMQ.Client;
@@ -19,15 +20,17 @@ namespace NotificationService.Worker
         private readonly ILogger<OrderCreatedConsumer> _logger;
         private readonly IEmailSender _emailSender;
         private readonly RabbitMqOptions _rabbitMQOptions;
+        private readonly IServiceScopeFactory _scopeFactory;
 
         private IConnection? _connection;
         private IChannel? _channel;
 
-        public OrderCreatedConsumer(ILogger<OrderCreatedConsumer> logger, IEmailSender emailSender, IOptions<RabbitMqOptions> rabbitMQOptions)
+        public OrderCreatedConsumer(ILogger<OrderCreatedConsumer> logger, IEmailSender emailSender, IOptions<RabbitMqOptions> rabbitMQOptions, IServiceScopeFactory scopeFactory)
         {
             _logger = logger;
             _emailSender = emailSender;
             _rabbitMQOptions = rabbitMQOptions.Value;
+            _scopeFactory = scopeFactory;
         }
 
         public override async Task StartAsync(CancellationToken cancellationToken)
@@ -74,8 +77,8 @@ namespace NotificationService.Worker
                 autoDelete: false,
                 arguments: new Dictionary<string, object?>
                 {
-            { "x-dead-letter-exchange", DeadLetterExchangeName },
-            { "x-dead-letter-routing-key", DeadLetterQueueName }
+                    { "x-dead-letter-exchange", DeadLetterExchangeName },
+                    { "x-dead-letter-routing-key", DeadLetterQueueName }
                 },
                 cancellationToken: cancellationToken);
 
@@ -123,6 +126,8 @@ namespace NotificationService.Worker
 
                     await _channel!.BasicAckAsync(deliveryTag, multiple: false);
 
+                    await SaveNotificationLogAsync(orderEvent, status: "Success");
+
                     _logger.LogInformation("Order {OrderId} processed successfully", orderEvent.OrderId);
                 }
                 catch (Exception ex)
@@ -132,6 +137,16 @@ namespace NotificationService.Worker
                     if (retryCount >= MaxRetryCount)
                     {
                         // »счерпали попытки Ч отправл€ем в DLQ без повтора
+                        try
+                        {
+                            var body = args.Body.ToArray();
+                            var json = Encoding.UTF8.GetString(body);
+                            var orderEvent = JsonSerializer.Deserialize<OrderCreatedEvent>(json);
+                            if (orderEvent is not null)
+                                await SaveNotificationLogAsync(orderEvent, status: "Failed", errorMessage: ex.Message);
+                        }
+                        catch { }
+
                         _logger.LogError(ex,
                             "Order processing failed after {MaxRetry} attempts, sending to DLQ. DeliveryTag: {Tag}",
                             MaxRetryCount,
@@ -161,6 +176,24 @@ namespace NotificationService.Worker
 
             // ƒержим воркер живым до сигнала остановки
             await Task.Delay(Timeout.Infinite, stoppingToken);
+        }
+
+        private async Task SaveNotificationLogAsync(OrderCreatedEvent orderEvent, string status, string? errorMessage = null)
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<NotificationDbContext>();
+
+            db.NotificationLogs.Add(new NotificationLog
+            {
+                OrderId = orderEvent.OrderId,
+                CustomerEmail = orderEvent.CustomerEmail,
+                Amount = orderEvent.Amount,
+                Status = status,
+                ErrorMessage = errorMessage,
+                ProcessedAt = DateTime.UtcNow
+            });
+
+            await db.SaveChangesAsync();
         }
 
         // ¬ызываетс€ при остановке хоста Ч закрываем соединение корректно
